@@ -42,10 +42,11 @@ fn output_with_nvtt(width: u32, height: u32, depth: u32, bounds: (f64, f64)) {
     );
     let data = NoiseTextureDescriptor::default()
         .with_size([width, height, depth])
-        .with_seamless(true)
         .with_channel_swizzles(ChannelSwizzles::Bgra)
         .with_rgba(
-            noise.with_bounds(ChannelBounds::splat(bounds)),
+            noise
+                .with_bounds(ChannelBounds::splat(bounds))
+                .with_seamless(true),
             Constant::new(-1.0),
             Constant::new(-1.0),
             Constant::new(1.0),

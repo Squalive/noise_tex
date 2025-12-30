@@ -12,8 +12,7 @@ use noise::NoiseFn;
 #[derive(Debug, Clone)]
 pub struct NoiseTextureDescriptor<C: Channels> {
     size: [u32; 3],
-    seamless: bool,
-    channel_bounds: [ChannelBounds; 4],
+    channel_configs: [ChannelConfig; 4],
     channel_swizzles: ChannelSwizzles,
     channels: C,
 }
@@ -22,8 +21,7 @@ impl Default for NoiseTextureDescriptor<()> {
     fn default() -> Self {
         Self {
             size: [1, 1, 1],
-            seamless: false,
-            channel_bounds: Default::default(),
+            channel_configs: Default::default(),
             channel_swizzles: ChannelSwizzles::default(),
             channels: (),
         }
@@ -33,11 +31,6 @@ impl Default for NoiseTextureDescriptor<()> {
 impl<C: Channels> NoiseTextureDescriptor<C> {
     pub fn with_size(mut self, size: [u32; 3]) -> Self {
         self.size = size;
-        self
-    }
-
-    pub fn with_seamless(mut self, seamless: bool) -> Self {
-        self.seamless = seamless;
         self
     }
 
@@ -53,9 +46,8 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     {
         NoiseTextureDescriptor {
             size: self.size,
-            seamless: self.seamless,
-            channel_bounds: [
-                r.bounds(),
+            channel_configs: [
+                ChannelConfig::new(r.bounds(), r.seamless()),
                 Default::default(),
                 Default::default(),
                 Default::default(),
@@ -74,10 +66,9 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     {
         NoiseTextureDescriptor {
             size: self.size,
-            seamless: self.seamless,
-            channel_bounds: [
-                r.bounds(),
-                g.bounds(),
+            channel_configs: [
+                ChannelConfig::new(r.bounds(), r.seamless()),
+                ChannelConfig::new(g.bounds(), g.seamless()),
                 Default::default(),
                 Default::default(),
             ],
@@ -102,8 +93,12 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     {
         NoiseTextureDescriptor {
             size: self.size,
-            seamless: self.seamless,
-            channel_bounds: [r.bounds(), g.bounds(), b.bounds(), Default::default()],
+            channel_configs: [
+                ChannelConfig::new(r.bounds(), r.seamless()),
+                ChannelConfig::new(g.bounds(), g.seamless()),
+                ChannelConfig::new(b.bounds(), b.seamless()),
+                Default::default(),
+            ],
             channel_swizzles: self.channel_swizzles,
             channels: ChannelRgb(r.into_noise(), g.into_noise(), b.into_noise()),
         }
@@ -128,8 +123,12 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     {
         NoiseTextureDescriptor {
             size: self.size,
-            seamless: self.seamless,
-            channel_bounds: [r.bounds(), g.bounds(), b.bounds(), a.bounds()],
+            channel_configs: [
+                ChannelConfig::new(r.bounds(), r.seamless()),
+                ChannelConfig::new(g.bounds(), g.seamless()),
+                ChannelConfig::new(b.bounds(), b.seamless()),
+                ChannelConfig::new(a.bounds(), a.seamless()),
+            ],
             channel_swizzles: self.channel_swizzles,
             channels: ChannelRgba(
                 r.into_noise(),
@@ -141,6 +140,7 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     }
 
     pub fn to_texture(&self) -> Vec<u8> {
+        #[derive(Clone, Copy)]
         struct PerChannelValues {
             bounds: ChannelBounds,
             x_extent: f64,
@@ -215,17 +215,64 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
             b * alpha + a * (1.0 - alpha)
         }
 
+        #[inline]
+        fn sample_seamless<T: Channels>(
+            channels: &T,
+            channel: PerChannelValues,
+            xyz: [f64; 3],
+            sample_fn: impl Fn(&T, [f64; 3]) -> f64,
+        ) -> f64 {
+            let value = channel.get_seamless_values(xyz[0], xyz[1], xyz[2]);
+
+            // Batch sample all 8 points using array
+            let samples: [f64; 8] = [
+                sample_fn(channels, value.sample_coords[0]),
+                sample_fn(channels, value.sample_coords[1]),
+                sample_fn(channels, value.sample_coords[2]),
+                sample_fn(channels, value.sample_coords[3]),
+                sample_fn(channels, value.sample_coords[4]),
+                sample_fn(channels, value.sample_coords[5]),
+                sample_fn(channels, value.sample_coords[6]),
+                sample_fn(channels, value.sample_coords[7]),
+            ];
+
+            // Extract channel values - all stack allocated
+            let c000 = samples[0];
+            let c100 = samples[1];
+            let c010 = samples[2];
+            let c110 = samples[3];
+            let c001 = samples[4];
+            let c101 = samples[5];
+            let c011 = samples[6];
+            let c111 = samples[7];
+
+            // X interpolation
+            let c00 = lerp(c000, c100, value.x_blend);
+            let c01 = lerp(c010, c110, value.x_blend);
+            let c10 = lerp(c001, c101, value.x_blend);
+            let c11 = lerp(c011, c111, value.x_blend);
+
+            // Y interpolation
+            let c0 = lerp(c00, c01, value.y_blend);
+            let c1 = lerp(c10, c11, value.y_blend);
+
+            // Z interpolation
+            lerp(c0, c1, value.z_blend)
+        }
+
         let [width, height, depth] = self.size;
 
         let mut data = vec![0u8; (width * height * depth) as usize * C::channel_count()];
 
         if let Some(len) = data.len().checked_div(C::channel_count()) {
-            let seamless = self.seamless;
-
-            let r_channel = PerChannelValues::new(width, height, depth, self.channel_bounds[0]);
-            let g_channel = PerChannelValues::new(width, height, depth, self.channel_bounds[1]);
-            let b_channel = PerChannelValues::new(width, height, depth, self.channel_bounds[2]);
-            let a_channel = PerChannelValues::new(width, height, depth, self.channel_bounds[3]);
+            let r_channel =
+                PerChannelValues::new(width, height, depth, self.channel_configs[0].bounds);
+            let g_channel =
+                PerChannelValues::new(width, height, depth, self.channel_configs[1].bounds);
+            let b_channel =
+                PerChannelValues::new(width, height, depth, self.channel_configs[2].bounds);
+            let a_channel =
+                PerChannelValues::new(width, height, depth, self.channel_configs[3].bounds);
 
             let wh = width * height;
             for index in 0..len {
@@ -235,103 +282,32 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
                 let x = slice_index % width;
 
                 let r_xyz = r_channel.get_xyz(x, y, z);
-                let g_xyz = r_channel.get_xyz(x, y, z);
-                let b_xyz = r_channel.get_xyz(x, y, z);
-                let a_xyz = r_channel.get_xyz(x, y, z);
+                let g_xyz = g_channel.get_xyz(x, y, z);
+                let b_xyz = b_channel.get_xyz(x, y, z);
+                let a_xyz = a_channel.get_xyz(x, y, z);
 
-                let [r, g, b, a] = if seamless {
-                    let values = [
-                        r_channel.get_seamless_values(r_xyz[0], r_xyz[1], r_xyz[2]),
-                        g_channel.get_seamless_values(g_xyz[0], g_xyz[1], g_xyz[2]),
-                        b_channel.get_seamless_values(b_xyz[0], b_xyz[1], b_xyz[2]),
-                        a_channel.get_seamless_values(a_xyz[0], a_xyz[1], a_xyz[2]),
-                    ];
-
-                    // Batch sample all 8 points using array
-                    let samples: [[f64; 4]; 8] = [
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[0],
-                            values[1].sample_coords[0],
-                            values[2].sample_coords[0],
-                            values[3].sample_coords[0],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[1],
-                            values[1].sample_coords[1],
-                            values[2].sample_coords[1],
-                            values[3].sample_coords[1],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[2],
-                            values[1].sample_coords[2],
-                            values[2].sample_coords[2],
-                            values[3].sample_coords[2],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[3],
-                            values[1].sample_coords[3],
-                            values[2].sample_coords[3],
-                            values[3].sample_coords[3],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[4],
-                            values[1].sample_coords[4],
-                            values[2].sample_coords[4],
-                            values[3].sample_coords[4],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[5],
-                            values[1].sample_coords[5],
-                            values[2].sample_coords[5],
-                            values[3].sample_coords[5],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[6],
-                            values[1].sample_coords[6],
-                            values[2].sample_coords[6],
-                            values[3].sample_coords[6],
-                        )),
-                        self.channels.get(SamplePoint::new(
-                            values[0].sample_coords[7],
-                            values[1].sample_coords[7],
-                            values[2].sample_coords[7],
-                            values[3].sample_coords[7],
-                        )),
-                    ];
-
-                    // Trilinear interpolation for each channel
-                    let mut result = [0.0; 4];
-
-                    // Process each channel independently
-                    for channel in 0..4 {
-                        // Extract channel values - all stack allocated
-                        let c000 = samples[0][channel];
-                        let c100 = samples[1][channel];
-                        let c010 = samples[2][channel];
-                        let c110 = samples[3][channel];
-                        let c001 = samples[4][channel];
-                        let c101 = samples[5][channel];
-                        let c011 = samples[6][channel];
-                        let c111 = samples[7][channel];
-
-                        // X interpolation
-                        let c00 = lerp(c000, c100, values[channel].x_blend);
-                        let c01 = lerp(c010, c110, values[channel].x_blend);
-                        let c10 = lerp(c001, c101, values[channel].x_blend);
-                        let c11 = lerp(c011, c111, values[channel].x_blend);
-
-                        // Y interpolation
-                        let c0 = lerp(c00, c01, values[channel].y_blend);
-                        let c1 = lerp(c10, c11, values[channel].y_blend);
-
-                        // Z interpolation
-                        result[channel] = lerp(c0, c1, values[channel].z_blend);
-                    }
-
-                    result
+                let r = if self.channel_configs[0].seamless {
+                    sample_seamless(&self.channels, r_channel, r_xyz, Channels::get_r)
                 } else {
-                    self.channels
-                        .get(SamplePoint::new(r_xyz, g_xyz, b_xyz, a_xyz))
+                    self.channels.get_r(r_xyz)
+                };
+
+                let g = if self.channel_configs[1].seamless {
+                    sample_seamless(&self.channels, g_channel, g_xyz, Channels::get_g)
+                } else {
+                    self.channels.get_g(g_xyz)
+                };
+
+                let b = if self.channel_configs[2].seamless {
+                    sample_seamless(&self.channels, b_channel, b_xyz, Channels::get_b)
+                } else {
+                    self.channels.get_b(b_xyz)
+                };
+
+                let a = if self.channel_configs[3].seamless {
+                    sample_seamless(&self.channels, a_channel, a_xyz, Channels::get_a)
+                } else {
+                    self.channels.get_a(a_xyz)
                 };
 
                 let [r, g, b, a] = match self.channel_swizzles {
@@ -370,6 +346,18 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct ChannelConfig {
+    bounds: ChannelBounds,
+    seamless: bool,
+}
+
+impl ChannelConfig {
+    fn new(bounds: ChannelBounds, seamless: bool) -> Self {
+        Self { bounds, seamless }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChannelBounds {
     pub x: (f64, f64),
@@ -404,24 +392,12 @@ pub enum ChannelSwizzles {
     Bgra,
 }
 
-#[derive(Clone, Copy)]
-pub struct SamplePoint {
-    pub r: [f64; 3],
-    pub g: [f64; 3],
-    pub b: [f64; 3],
-    pub a: [f64; 3],
-}
-
-impl SamplePoint {
-    fn new(r: [f64; 3], g: [f64; 3], b: [f64; 3], a: [f64; 3]) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
 pub trait NoiseChannel<T: NoiseFn<f64, 3>> {
     fn into_noise(self) -> T;
 
     fn bounds(&self) -> ChannelBounds;
+
+    fn seamless(&self) -> bool;
 }
 
 impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for T {
@@ -434,15 +410,28 @@ impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for T {
     fn bounds(&self) -> ChannelBounds {
         ChannelBounds::default()
     }
+
+    #[inline]
+    fn seamless(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
-pub struct Bounded<T> {
+pub struct NoiseFnChannel<T> {
     noise: T,
     bounds: ChannelBounds,
+    seamless: bool,
 }
 
-impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for Bounded<T> {
+impl<T> NoiseFnChannel<T> {
+    pub fn with_seamless(mut self, seamless: bool) -> Self {
+        self.seamless = seamless;
+        self
+    }
+}
+
+impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for NoiseFnChannel<T> {
     #[inline]
     fn into_noise(self) -> T {
         self.noise
@@ -452,17 +441,23 @@ impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for Bounded<T> {
     fn bounds(&self) -> ChannelBounds {
         self.bounds
     }
+
+    #[inline]
+    fn seamless(&self) -> bool {
+        self.seamless
+    }
 }
 
 pub trait NoiseChannelEx: Sized {
-    fn with_bounds(self, bounds: ChannelBounds) -> Bounded<Self>;
+    fn with_bounds(self, bounds: ChannelBounds) -> NoiseFnChannel<Self>;
 }
 
 impl<T: NoiseFn<f64, 3> + Sized> NoiseChannelEx for T {
-    fn with_bounds(self, bounds: ChannelBounds) -> Bounded<Self> {
-        Bounded {
+    fn with_bounds(self, bounds: ChannelBounds) -> NoiseFnChannel<Self> {
+        NoiseFnChannel {
             noise: self,
             bounds,
+            seamless: false,
         }
     }
 }
@@ -470,7 +465,24 @@ impl<T: NoiseFn<f64, 3> + Sized> NoiseChannelEx for T {
 pub trait Channels {
     fn channel_count() -> usize;
 
-    fn get(&self, point: SamplePoint) -> [f64; 4];
+    fn get_r(&self, _point: [f64; 3]) -> f64 {
+        0.0
+    }
+
+    #[inline(always)]
+    fn get_g(&self, _point: [f64; 3]) -> f64 {
+        0.0
+    }
+
+    #[inline(always)]
+    fn get_b(&self, _point: [f64; 3]) -> f64 {
+        0.0
+    }
+
+    #[inline(always)]
+    fn get_a(&self, _point: [f64; 3]) -> f64 {
+        0.0
+    }
 }
 
 impl Channels for () {
@@ -480,7 +492,22 @@ impl Channels for () {
     }
 
     #[inline(always)]
-    fn get(&self, _: SamplePoint) -> [f64; 4] {
+    fn get_r(&self, _: [f64; 3]) -> f64 {
+        unreachable!()
+    }
+
+    #[inline(always)]
+    fn get_g(&self, _: [f64; 3]) -> f64 {
+        unreachable!()
+    }
+
+    #[inline(always)]
+    fn get_b(&self, _: [f64; 3]) -> f64 {
+        unreachable!()
+    }
+
+    #[inline(always)]
+    fn get_a(&self, _: [f64; 3]) -> f64 {
         unreachable!()
     }
 }
@@ -498,9 +525,8 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: SamplePoint) -> [f64; 4] {
-        let Self(r) = self;
-        [r.get(point.r), 0.0, 0.0, 0.0]
+    fn get_r(&self, point: [f64; 3]) -> f64 {
+        self.0.get(point)
     }
 }
 
@@ -518,9 +544,13 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: SamplePoint) -> [f64; 4] {
-        let Self(r, g) = self;
-        [r.get(point.r), g.get(point.g), 0.0, 0.0]
+    fn get_r(&self, point: [f64; 3]) -> f64 {
+        self.0.get(point)
+    }
+
+    #[inline(always)]
+    fn get_g(&self, point: [f64; 3]) -> f64 {
+        self.1.get(point)
     }
 }
 
@@ -539,9 +569,18 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: SamplePoint) -> [f64; 4] {
-        let Self(r, g, b) = self;
-        [r.get(point.r), g.get(point.g), b.get(point.b), 0.0]
+    fn get_r(&self, point: [f64; 3]) -> f64 {
+        self.0.get(point)
+    }
+
+    #[inline(always)]
+    fn get_g(&self, point: [f64; 3]) -> f64 {
+        self.1.get(point)
+    }
+
+    #[inline(always)]
+    fn get_b(&self, point: [f64; 3]) -> f64 {
+        self.2.get(point)
     }
 }
 
@@ -561,14 +600,23 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: SamplePoint) -> [f64; 4] {
-        let Self(r, g, b, a) = self;
-        [
-            r.get(point.r),
-            g.get(point.g),
-            b.get(point.b),
-            a.get(point.a),
-        ]
+    fn get_r(&self, point: [f64; 3]) -> f64 {
+        self.0.get(point)
+    }
+
+    #[inline(always)]
+    fn get_g(&self, point: [f64; 3]) -> f64 {
+        self.1.get(point)
+    }
+
+    #[inline(always)]
+    fn get_b(&self, point: [f64; 3]) -> f64 {
+        self.2.get(point)
+    }
+
+    #[inline(always)]
+    fn get_a(&self, point: [f64; 3]) -> f64 {
+        self.3.get(point)
     }
 }
 
