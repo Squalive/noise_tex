@@ -413,7 +413,7 @@ impl<T: NoiseFn<f64, 3>> NoiseChannel<T> for T {
 
     #[inline]
     fn seamless(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -457,7 +457,7 @@ impl<T: NoiseFn<f64, 3> + Sized> NoiseChannelEx for T {
         NoiseFnChannel {
             noise: self,
             bounds,
-            seamless: false,
+            seamless: true,
         }
     }
 }
