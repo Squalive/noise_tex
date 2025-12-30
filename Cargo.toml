@@ -1,5 +1,5 @@
 [package]
-name = "noise_tex_generator"
+name = "noise_tex"
 version = "0.1.0"
 edition = "2024"
 
@@ -13,6 +13,7 @@ noise = "0.9.0"
 
 [dev-dependencies]
 image = "0.25.9"
+nvtt_rs = { git = "https://github.com/Squalive/nvtt.git", features = ["cuda"] }
 
 [[example]]
 name = "generate"

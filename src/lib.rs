@@ -4,6 +4,8 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+use core::ops::{Add, Mul};
+
 use alloc::vec;
 use alloc::vec::Vec;
 use noise::NoiseFn;
@@ -12,41 +14,65 @@ type NoiseT = f64;
 
 #[derive(Debug, Clone)]
 pub struct NoiseTextureDescriptor<C: Channels> {
-    extent: [u32; 3],
-    scale: f64,
+    size: [u32; 3],
+    bounds: [(f64, f64); 3],
+    seamless: bool,
     channels: C,
 }
 
 impl Default for NoiseTextureDescriptor<()> {
     fn default() -> Self {
         Self {
-            extent: [1, 1, 1],
-            scale: 1.0,
+            size: [1, 1, 1],
+            bounds: [(0.0, 1.0); 3],
+            seamless: false,
             channels: (),
         }
     }
 }
 
 impl<C: Channels> NoiseTextureDescriptor<C> {
-    pub fn with_extent(mut self, extent: [u32; 3]) -> Self {
-        self.extent = extent;
+    pub fn with_size(mut self, size: [u32; 3]) -> Self {
+        self.size = size;
         self
     }
 
-    pub fn with_scale(mut self, scale: f64) -> Self {
-        self.scale = scale;
+    pub fn with_bounds(mut self, bounds: [(f64, f64); 3]) -> Self {
+        self.bounds = bounds;
+        self
+    }
+
+    pub fn with_seamless(mut self, seamless: bool) -> Self {
+        self.seamless = seamless;
         self
     }
 
     pub fn to_texture(&self) -> Vec<u8> {
-        let [width, height, depth] = self.extent;
+        /// Performs linear interpolation between two values.
+        #[inline(always)]
+        fn lerp<T>(a: T, b: T, alpha: f64) -> T
+        where
+            T: Mul<f64, Output = T> + Add<Output = T>,
+        {
+            b * alpha + a * (1.0 - alpha)
+        }
+
+        let [width, height, depth] = self.size;
 
         let mut data = vec![0u8; (width * height * depth) as usize * C::channel_count()];
 
         if let Some(len) = data.len().checked_div(C::channel_count()) {
-            let inv_width_scale = 1.0 / width as f64 * self.scale;
-            let inv_height_scale = 1.0 / height as f64 * self.scale;
-            let inv_depth_scale = 1.0 / depth as f64 * self.scale;
+            let seamless = self.seamless;
+
+            let [x_bounds, y_bounds, z_bounds] = self.bounds;
+
+            let x_extent = x_bounds.1 - x_bounds.0;
+            let y_extent = y_bounds.1 - y_bounds.0;
+            let z_extent = z_bounds.1 - z_bounds.0;
+
+            let x_step = x_extent / width as f64;
+            let y_step = y_extent / height as f64;
+            let z_step = z_extent / depth as f64;
 
             let wh = width * height;
             for index in 0..len {
@@ -55,33 +81,95 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
                 let y = slice_index / width;
                 let x = slice_index % width;
 
-                let [r, g, b, a] = self.channels.get([
-                    x as f64 * inv_width_scale,
-                    y as f64 * inv_height_scale,
-                    z as f64 * inv_depth_scale,
-                ]);
+                let cur_x = x_bounds.0 + x_step * x as f64;
+                let cur_y = y_bounds.0 + y_step * y as f64;
+                let cur_z = z_bounds.0 + z_step * z as f64;
+
+                let [r, g, b, a] = if seamless {
+                    // Pre-calculate all sample coordinates
+                    let sample_coords = [
+                        [cur_x, cur_y, cur_z],
+                        [cur_x + x_extent, cur_y, cur_z],
+                        [cur_x, cur_y + y_extent, cur_z],
+                        [cur_x + x_extent, cur_y + y_extent, cur_z],
+                        [cur_x, cur_y, cur_z + z_extent],
+                        [cur_x + x_extent, cur_y, cur_z + z_extent],
+                        [cur_x, cur_y + y_extent, cur_z + z_extent],
+                        [cur_x + x_extent, cur_y + y_extent, cur_z + z_extent],
+                    ];
+
+                    // Calculate blend factors
+                    let x_blend = 1.0 - (cur_x - x_bounds.0) / x_extent;
+                    let y_blend = 1.0 - (cur_y - y_bounds.0) / y_extent;
+                    let z_blend = 1.0 - (cur_z - z_bounds.0) / z_extent;
+
+                    // Batch sample all 8 points using array
+                    let samples: [[f64; 4]; 8] = [
+                        self.channels.get(sample_coords[0]),
+                        self.channels.get(sample_coords[1]),
+                        self.channels.get(sample_coords[2]),
+                        self.channels.get(sample_coords[3]),
+                        self.channels.get(sample_coords[4]),
+                        self.channels.get(sample_coords[5]),
+                        self.channels.get(sample_coords[6]),
+                        self.channels.get(sample_coords[7]),
+                    ];
+
+                    // Trilinear interpolation for each channel
+                    let mut result = [0.0; 4];
+
+                    // Process each channel independently
+                    for channel in 0..4 {
+                        // Extract channel values - all stack allocated
+                        let c000 = samples[0][channel];
+                        let c100 = samples[1][channel];
+                        let c010 = samples[2][channel];
+                        let c110 = samples[3][channel];
+                        let c001 = samples[4][channel];
+                        let c101 = samples[5][channel];
+                        let c011 = samples[6][channel];
+                        let c111 = samples[7][channel];
+
+                        // X interpolation
+                        let c00 = lerp(c000, c100, x_blend);
+                        let c01 = lerp(c010, c110, x_blend);
+                        let c10 = lerp(c001, c101, x_blend);
+                        let c11 = lerp(c011, c111, x_blend);
+
+                        // Y interpolation
+                        let c0 = lerp(c00, c01, y_blend);
+                        let c1 = lerp(c10, c11, y_blend);
+
+                        // Z interpolation
+                        result[channel] = lerp(c0, c1, z_blend);
+                    }
+
+                    result
+                } else {
+                    self.channels.get([cur_x, cur_y, cur_z])
+                };
 
                 // Calculate base index in data array for this pixel
                 let base_index = index * C::channel_count();
 
                 match C::channel_count() {
                     1 => {
-                        data[base_index] = r;
+                        data[base_index] = normalize_noise_to_u8(r);
                     }
                     2 => {
-                        data[base_index] = r;
-                        data[base_index + 1] = g;
+                        data[base_index] = normalize_noise_to_u8(r);
+                        data[base_index + 1] = normalize_noise_to_u8(g);
                     }
                     3 => {
-                        data[base_index] = r;
-                        data[base_index + 1] = g;
-                        data[base_index + 2] = b;
+                        data[base_index] = normalize_noise_to_u8(r);
+                        data[base_index + 1] = normalize_noise_to_u8(g);
+                        data[base_index + 2] = normalize_noise_to_u8(b);
                     }
                     4 => {
-                        data[base_index] = r;
-                        data[base_index + 1] = g;
-                        data[base_index + 2] = b;
-                        data[base_index + 3] = a;
+                        data[base_index] = normalize_noise_to_u8(r);
+                        data[base_index + 1] = normalize_noise_to_u8(g);
+                        data[base_index + 2] = normalize_noise_to_u8(b);
+                        data[base_index + 3] = normalize_noise_to_u8(a);
                     }
                     _ => unreachable!(),
                 }
@@ -94,10 +182,16 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
 
 impl NoiseTextureDescriptor<()> {
     pub fn with_r<T: NoiseFn<NoiseT, 3>>(self, noise: T) -> NoiseTextureDescriptor<ChannelR<T>> {
-        let Self { extent, scale, .. } = self;
+        let Self {
+            size,
+            bounds,
+            seamless,
+            ..
+        } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelR(noise),
         }
     }
@@ -108,10 +202,16 @@ where
     R: NoiseFn<NoiseT, 3>,
 {
     pub fn with_r<T: NoiseFn<NoiseT, 3>>(self, noise: T) -> NoiseTextureDescriptor<ChannelR<T>> {
-        let Self { extent, scale, .. } = self;
+        let Self {
+            size,
+            bounds,
+            seamless,
+            ..
+        } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelR(noise),
         }
     }
@@ -121,13 +221,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRg<R, T>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelR(r),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(r, noise),
         }
     }
@@ -143,13 +245,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRg<T, G>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(_, g),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(noise, g),
         }
     }
@@ -159,13 +263,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRg<R, T>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(r, _),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(r, noise),
         }
     }
@@ -175,13 +281,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRgb<R, G, T>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRg(r, g),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, g, noise),
         }
     }
@@ -198,13 +306,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRgb<T, G, B>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(_, g, b),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(noise, g, b),
         }
     }
@@ -214,13 +324,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRgb<R, T, B>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, _, b),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, noise, b),
         }
     }
@@ -230,13 +342,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRgb<R, G, T>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, g, _),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, g, noise),
         }
     }
@@ -246,13 +360,15 @@ where
         noise: T,
     ) -> NoiseTextureDescriptor<ChannelRgba<R, G, B, T>> {
         let Self {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgb(r, g, b),
         } = self;
         NoiseTextureDescriptor {
-            extent,
-            scale,
+            size,
+            bounds,
+            seamless,
             channels: ChannelRgba(r, g, b, noise),
         }
     }
@@ -261,7 +377,7 @@ where
 pub trait Channels {
     fn channel_count() -> usize;
 
-    fn get(&self, point: [NoiseT; 3]) -> [u8; 4];
+    fn get(&self, point: [NoiseT; 3]) -> [f64; 4];
 }
 
 impl Channels for () {
@@ -271,7 +387,7 @@ impl Channels for () {
     }
 
     #[inline(always)]
-    fn get(&self, _: [NoiseT; 3]) -> [u8; 4] {
+    fn get(&self, _: [NoiseT; 3]) -> [f64; 4] {
         unreachable!()
     }
 }
@@ -289,10 +405,9 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: [NoiseT; 3]) -> [u8; 4] {
+    fn get(&self, point: [NoiseT; 3]) -> [f64; 4] {
         let Self(r) = self;
-        let r = normalize_noise_to_u8(r.get(point));
-        [r, 0, 0, 0]
+        [r.get(point), 0.0, 0.0, 0.0]
     }
 }
 
@@ -310,11 +425,9 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: [NoiseT; 3]) -> [u8; 4] {
+    fn get(&self, point: [NoiseT; 3]) -> [f64; 4] {
         let Self(r, g) = self;
-        let r = normalize_noise_to_u8(r.get(point));
-        let g = normalize_noise_to_u8(g.get(point));
-        [r, g, 0, 0]
+        [r.get(point), g.get(point), 0.0, 0.0]
     }
 }
 
@@ -333,12 +446,9 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: [NoiseT; 3]) -> [u8; 4] {
+    fn get(&self, point: [NoiseT; 3]) -> [f64; 4] {
         let Self(r, g, b) = self;
-        let r = normalize_noise_to_u8(r.get(point));
-        let g = normalize_noise_to_u8(g.get(point));
-        let b = normalize_noise_to_u8(b.get(point));
-        [r, g, b, 0]
+        [r.get(point), g.get(point), b.get(point), 0.0]
     }
 }
 
@@ -358,13 +468,9 @@ where
     }
 
     #[inline(always)]
-    fn get(&self, point: [NoiseT; 3]) -> [u8; 4] {
+    fn get(&self, point: [NoiseT; 3]) -> [f64; 4] {
         let Self(r, g, b, a) = self;
-        let r = normalize_noise_to_u8(r.get(point));
-        let g = normalize_noise_to_u8(g.get(point));
-        let b = normalize_noise_to_u8(b.get(point));
-        let a = normalize_noise_to_u8(a.get(point));
-        [r, g, b, a]
+        [r.get(point), g.get(point), b.get(point), a.get(point)]
     }
 }
 
