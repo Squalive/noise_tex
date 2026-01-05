@@ -1,13 +1,6 @@
-#![no_std]
-
-extern crate alloc;
-#[cfg(feature = "std")]
-extern crate std;
-
-use alloc::vec;
-use alloc::vec::Vec;
 use core::ops::{Add, Mul};
 use noise::NoiseFn;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Debug, Clone)]
 pub struct NoiseTextureDescriptor<C: Channels> {
@@ -41,7 +34,7 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
 
     pub fn with_r<R, RC>(self, r: RC) -> NoiseTextureDescriptor<ChannelR<R>>
     where
-        R: NoiseFn<f64, 3>,
+        R: NoiseFn<f64, 3> + Send + Sync,
         RC: NoiseChannel<R>,
     {
         NoiseTextureDescriptor {
@@ -59,9 +52,9 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
 
     pub fn with_rg<R, G, RC, GC>(self, r: RC, g: GC) -> NoiseTextureDescriptor<ChannelRg<R, G>>
     where
-        R: NoiseFn<f64, 3>,
+        R: NoiseFn<f64, 3> + Send + Sync,
         RC: NoiseChannel<R>,
-        G: NoiseFn<f64, 3>,
+        G: NoiseFn<f64, 3> + Send + Sync,
         GC: NoiseChannel<G>,
     {
         NoiseTextureDescriptor {
@@ -84,11 +77,11 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
         b: BC,
     ) -> NoiseTextureDescriptor<ChannelRgb<R, G, B>>
     where
-        R: NoiseFn<f64, 3>,
+        R: NoiseFn<f64, 3> + Send + Sync,
         RC: NoiseChannel<R>,
-        G: NoiseFn<f64, 3>,
+        G: NoiseFn<f64, 3> + Send + Sync,
         GC: NoiseChannel<G>,
-        B: NoiseFn<f64, 3>,
+        B: NoiseFn<f64, 3> + Send + Sync,
         BC: NoiseChannel<B>,
     {
         NoiseTextureDescriptor {
@@ -112,13 +105,13 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
         a: AC,
     ) -> NoiseTextureDescriptor<ChannelRgba<R, G, B, A>>
     where
-        R: NoiseFn<f64, 3>,
+        R: NoiseFn<f64, 3> + Send + Sync,
         RC: NoiseChannel<R>,
-        G: NoiseFn<f64, 3>,
+        G: NoiseFn<f64, 3> + Send + Sync,
         GC: NoiseChannel<G>,
-        B: NoiseFn<f64, 3>,
+        B: NoiseFn<f64, 3> + Send + Sync,
         BC: NoiseChannel<B>,
-        A: NoiseFn<f64, 3>,
+        A: NoiseFn<f64, 3> + Send + Sync,
         AC: NoiseChannel<A>,
     {
         NoiseTextureDescriptor {
@@ -275,46 +268,53 @@ impl<C: Channels> NoiseTextureDescriptor<C> {
                 PerChannelValues::new(width, height, depth, self.channel_configs[3].bounds);
 
             let wh = width * height;
-            for index in 0..len {
-                let z = index as u32 / wh;
-                let slice_index = index as u32 % wh;
-                let y = slice_index / width;
-                let x = slice_index % width;
+            let texels = (0..len)
+                .into_par_iter()
+                .map(|index| {
+                    let z = index as u32 / wh;
+                    let slice_index = index as u32 % wh;
+                    let y = slice_index / width;
+                    let x = slice_index % width;
 
-                let r_xyz = r_channel.get_xyz(x, y, z);
-                let g_xyz = g_channel.get_xyz(x, y, z);
-                let b_xyz = b_channel.get_xyz(x, y, z);
-                let a_xyz = a_channel.get_xyz(x, y, z);
+                    let r_xyz = r_channel.get_xyz(x, y, z);
+                    let g_xyz = g_channel.get_xyz(x, y, z);
+                    let b_xyz = b_channel.get_xyz(x, y, z);
+                    let a_xyz = a_channel.get_xyz(x, y, z);
 
-                let r = if self.channel_configs[0].seamless {
-                    sample_seamless(&self.channels, r_channel, r_xyz, Channels::get_r)
-                } else {
-                    self.channels.get_r(r_xyz)
-                };
+                    let r = if self.channel_configs[0].seamless {
+                        sample_seamless(&self.channels, r_channel, r_xyz, Channels::get_r)
+                    } else {
+                        self.channels.get_r(r_xyz)
+                    };
 
-                let g = if self.channel_configs[1].seamless {
-                    sample_seamless(&self.channels, g_channel, g_xyz, Channels::get_g)
-                } else {
-                    self.channels.get_g(g_xyz)
-                };
+                    let g = if self.channel_configs[1].seamless {
+                        sample_seamless(&self.channels, g_channel, g_xyz, Channels::get_g)
+                    } else {
+                        self.channels.get_g(g_xyz)
+                    };
 
-                let b = if self.channel_configs[2].seamless {
-                    sample_seamless(&self.channels, b_channel, b_xyz, Channels::get_b)
-                } else {
-                    self.channels.get_b(b_xyz)
-                };
+                    let b = if self.channel_configs[2].seamless {
+                        sample_seamless(&self.channels, b_channel, b_xyz, Channels::get_b)
+                    } else {
+                        self.channels.get_b(b_xyz)
+                    };
 
-                let a = if self.channel_configs[3].seamless {
-                    sample_seamless(&self.channels, a_channel, a_xyz, Channels::get_a)
-                } else {
-                    self.channels.get_a(a_xyz)
-                };
+                    let a = if self.channel_configs[3].seamless {
+                        sample_seamless(&self.channels, a_channel, a_xyz, Channels::get_a)
+                    } else {
+                        self.channels.get_a(a_xyz)
+                    };
 
-                let [r, g, b, a] = match self.channel_swizzles {
-                    ChannelSwizzles::Rgba => [r, g, b, a],
-                    ChannelSwizzles::Bgra => [b, g, r, a],
-                };
+                    let [r, g, b, a] = match self.channel_swizzles {
+                        ChannelSwizzles::Rgba => [r, g, b, a],
+                        ChannelSwizzles::Bgra => [b, g, r, a],
+                    };
 
+                    (index, r, g, b, a)
+                })
+                .collect::<Vec<_>>();
+
+            for (index, r, g, b, a) in texels {
                 // Calculate base index in data array for this pixel
                 let base_index = index * C::channel_count();
 
@@ -462,7 +462,7 @@ impl<T: NoiseFn<f64, 3> + Sized> NoiseChannelEx for T {
     }
 }
 
-pub trait Channels {
+pub trait Channels: Send + Sync {
     fn channel_count() -> usize;
 
     fn get_r(&self, _point: [f64; 3]) -> f64 {
@@ -517,7 +517,7 @@ pub struct ChannelR<R>(R);
 
 impl<R> Channels for ChannelR<R>
 where
-    R: NoiseFn<f64, 3>,
+    R: NoiseFn<f64, 3> + Send + Sync,
 {
     #[inline(always)]
     fn channel_count() -> usize {
@@ -535,8 +535,8 @@ pub struct ChannelRg<R, G>(R, G);
 
 impl<R, G> Channels for ChannelRg<R, G>
 where
-    R: NoiseFn<f64, 3>,
-    G: NoiseFn<f64, 3>,
+    R: NoiseFn<f64, 3> + Send + Sync,
+    G: NoiseFn<f64, 3> + Send + Sync,
 {
     #[inline(always)]
     fn channel_count() -> usize {
@@ -559,9 +559,9 @@ pub struct ChannelRgb<R, G, B>(R, G, B);
 
 impl<R, G, B> Channels for ChannelRgb<R, G, B>
 where
-    R: NoiseFn<f64, 3>,
-    G: NoiseFn<f64, 3>,
-    B: NoiseFn<f64, 3>,
+    R: NoiseFn<f64, 3> + Send + Sync,
+    G: NoiseFn<f64, 3> + Send + Sync,
+    B: NoiseFn<f64, 3> + Send + Sync,
 {
     #[inline(always)]
     fn channel_count() -> usize {
@@ -589,10 +589,10 @@ pub struct ChannelRgba<R, G, B, A>(R, G, B, A);
 
 impl<R, G, B, A> Channels for ChannelRgba<R, G, B, A>
 where
-    R: NoiseFn<f64, 3>,
-    G: NoiseFn<f64, 3>,
-    B: NoiseFn<f64, 3>,
-    A: NoiseFn<f64, 3>,
+    R: NoiseFn<f64, 3> + Send + Sync,
+    G: NoiseFn<f64, 3> + Send + Sync,
+    B: NoiseFn<f64, 3> + Send + Sync,
+    A: NoiseFn<f64, 3> + Send + Sync,
 {
     #[inline(always)]
     fn channel_count() -> usize {

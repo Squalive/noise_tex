@@ -1,4 +1,4 @@
-use noise::{Constant, Negate, Worley};
+use noise::{Constant, Perlin};
 use nt_lib::{ChannelBounds, ChannelSwizzles, NoiseChannelEx, NoiseTextureDescriptor};
 use nvtt_rs::{CUDA_SUPPORTED, CompressionOptions, Context, InputFormat, OutputOptions, Surface};
 
@@ -35,16 +35,11 @@ fn main() {
 // }
 
 fn output_with_nvtt(width: u32, height: u32, depth: u32, bounds: (f64, f64)) {
-    let noise = Negate::new(
-        Worley::default()
-            .set_return_type(noise::core::worley::ReturnType::Distance)
-            .set_frequency(0.5),
-    );
     let data = NoiseTextureDescriptor::default()
         .with_size([width, height, depth])
         .with_channel_swizzles(ChannelSwizzles::Bgra)
         .with_rgba(
-            noise
+            Perlin::default()
                 .with_bounds(ChannelBounds::splat(bounds))
                 .with_seamless(true),
             Constant::new(-1.0),
